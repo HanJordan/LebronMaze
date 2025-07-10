@@ -1,0 +1,647 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>3D Maze Game</title>
+  <style>
+    body { margin: 0; overflow: hidden; background: #111; }
+    #instructions {
+      position: absolute; top: 20px; left: 50%; transform: translateX(-50%);
+      color: #fff; background: rgba(0,0,0,0.7); padding: 16px 24px; border-radius: 8px;
+      font-family: sans-serif; z-index: 10; text-align: center;
+    }
+    #win {
+      display: none; position: absolute; top: 50%; left: 50%; transform: translate(-50%,-50%);
+      color: #fff; background: #222; padding: 32px 48px; border-radius: 12px;
+      font-size: 2em; font-family: sans-serif; z-index: 20;
+    }
+  </style>
+</head>
+<body>
+  <div id="instructions">
+    Click to play!<br>
+    Move: <b>WASD</b> &nbsp; Look: <b>Mouse</b><br>
+    Find the exit (green block)!
+  </div>
+  <div id="hp-display" style="position:fixed;top:16px;left:16px;z-index:60;color:#fff;font-size:1.2em;font-family:sans-serif;">HP: 3</div>
+  <div id="battery-display" style="position:fixed;top:40px;left:16px;z-index:60;color:#fff;font-size:1.2em;font-family:sans-serif;">Battery: 100%</div>
+  <div id="compass-container" style="position:fixed;top:16px;left:50%;transform:translateX(-50%);z-index:50;pointer-events:none;">
+    <div id="compass" style="width:80px;height:80px;position:relative;">
+      <svg width="80" height="80">
+        <circle cx="40" cy="40" r="38" stroke="#fff" stroke-width="2" fill="rgba(0,0,0,0.4)" />
+        <polygon id="compass-needle" points="40,10 35,40 45,40" fill="#00ff66" />
+      </svg>
+      <div style="position:absolute;top:60px;left:50%;transform:translateX(-50%);color:#fff;font-size:0.9em;">N</div>
+    </div>
+    <div id="noclip-indicator" style="display:none;color:#ff0;font-size:1em;text-align:center;margin-top:2px;">Noclip ON</div>
+  </div>
+  <div id="win-overlay" style="display:none; position:fixed; top:0; left:0; width:100vw; height:100vh; background:rgba(20,40,20,0.97); z-index:100; display:flex; flex-direction:column; align-items:center; justify-content:center;">
+    <h1 style="color:#00ff66; font-size:3em; margin-bottom:0.5em;">You Win! 🎉</h1>
+    <p style="color:#fff; font-size:1.5em; margin-bottom:1.5em;">Congratulations, you escaped the maze!</p>
+    <button id="restart-btn" style="font-size:1.2em; padding:0.7em 2em; border:none; border-radius:8px; background:#00ff66; color:#222; cursor:pointer;">Restart</button>
+  </div>
+  <div id="gameover-overlay" style="display:none; position:fixed; top:0; left:0; width:100vw; height:100vh; background:rgba(40,20,20,0.97); background-image:url('i.png'); background-size:cover; background-position:center; z-index:200; display:flex; flex-direction:column; align-items:center; justify-content:center;">
+    <h1 style="color:#ff4444; font-size:3em; margin-bottom:0.5em;">Game Over</h1>
+    <p style="color:#fff; font-size:1.5em; margin-bottom:1.5em;">You were caught by the enemy!</p>
+    <button id="gameover-restart-btn" style="font-size:1.2em; padding:0.7em 2em; border:none; border-radius:8px; background:#ff4444; color:#222; cursor:pointer;">Restart</button>
+  </div>
+  <div id="danger-indicator" style="display:none;position:fixed;top:0;left:0;width:100vw;height:100vh;z-index:150;pointer-events:none;"></div>
+  <script type="module">
+    import * as THREE from 'three';
+    import { PointerLockControls } from 'three/examples/jsm/controls/PointerLockControls.js';
+    import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
+
+    // Maze generation (recursive backtracker)
+    const MAZE_SIZE = 10;
+    const CELL_SIZE = 8;
+    let maze, camera, scene, renderer, controls, win, objects, exitPos, exit, move, prevTime, noclip, velocityY, isOnGround;
+    let enemy, enemyPath, enemyPathIndex, enemySpeed, enemyCooldown, playerHP, gameOver;
+    let enemyPathCells, enemyPathTimer = 0;
+    let flashlight, batteryLevel, isFlashlightOn, batteryDrainRate;
+
+    function generateMaze() {
+      maze = [];
+      for (let y = 0; y < MAZE_SIZE; y++) {
+        maze[y] = [];
+        for (let x = 0; x < MAZE_SIZE; x++) {
+          maze[y][x] = { visited: false, walls: [true, true, true, true] };
+        }
+      }
+      function shuffle(arr) {
+        for (let i = arr.length - 1; i > 0; i--) {
+          const j = Math.floor(Math.random() * (i + 1));
+          [arr[i], arr[j]] = [arr[j], arr[i]];
+        }
+      }
+      function carve(x, y) {
+        maze[y][x].visited = true;
+        const dirs = [0, 1, 2, 3];
+        shuffle(dirs);
+        for (const dir of dirs) {
+          const nx = x + [0, 1, 0, -1][dir];
+          const ny = y + [-1, 0, 1, 0][dir];
+          if (ny >= 0 && ny < MAZE_SIZE && nx >= 0 && nx < MAZE_SIZE && !maze[ny][nx].visited) {
+            maze[y][x].walls[dir] = false;
+            maze[ny][nx].walls[(dir + 2) % 4] = false;
+            carve(nx, ny);
+          }
+        }
+      }
+      carve(0, 0);
+    }
+
+    function clearScene() {
+      if (scene) {
+        while (scene.children.length > 0) {
+          scene.remove(scene.children[0]);
+        }
+      }
+    }
+
+    function init() {
+      win = false;
+      gameOver = false;
+      objects = [];
+      exitPos = { x: MAZE_SIZE - 1, y: MAZE_SIZE - 1 };
+      move = { forward: false, backward: false, left: false, right: false, jump: false, down: false };
+      prevTime = performance.now();
+      noclip = false;
+      velocityY = 0;
+      isOnGround = true;
+      playerHP = 1;
+      batteryLevel = 100;
+      isFlashlightOn = false;
+      batteryDrainRate = 0.5; // % per second
+      document.getElementById('hp-display').textContent = 'HP: ' + playerHP;
+      document.getElementById('battery-display').textContent = 'Battery: ' + batteryLevel + '%';
+      document.getElementById('gameover-overlay').style.display = 'none';
+      generateMaze();
+      if (!scene) scene = new THREE.Scene();
+      else clearScene();
+      scene.background = new THREE.Color(0x000000); // Very dark background
+
+      if (!camera) camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+      camera.position.set(CELL_SIZE / 2, 2, CELL_SIZE / 2);
+      camera.rotation.set(0, 0, 0);
+
+      // Lights
+      const ambient = new THREE.AmbientLight(0xffffff, 0.1); // Very dim ambient light
+      scene.add(ambient);
+      const dirLight = new THREE.DirectionalLight(0xffffff, 0.3); // Dimmer directional light
+      dirLight.position.set(1, 10, 1);
+      scene.add(dirLight);
+      // Flashlight
+      flashlight = new THREE.SpotLight(0xffffff, 0, 15, Math.PI / 6, 0.5, 1);
+      flashlight.position.copy(camera.position);
+      flashlight.target.position.set(0, 0, -1);
+      scene.add(flashlight);
+      scene.add(flashlight.target);
+
+      // Floor
+      const floorGeo = new THREE.PlaneGeometry(MAZE_SIZE * CELL_SIZE, MAZE_SIZE * CELL_SIZE);
+      const floorMat = new THREE.MeshPhongMaterial({ color: 0x444455 });
+      const floor = new THREE.Mesh(floorGeo, floorMat);
+      floor.rotation.x = -Math.PI / 2;
+      scene.add(floor);
+
+      // Maze walls
+      const wallGeo = new THREE.BoxGeometry(CELL_SIZE, 4, 0.5);
+      const wallMat = new THREE.MeshPhongMaterial({ color: 0x8888aa });
+      for (let y = 0; y < MAZE_SIZE; y++) {
+        for (let x = 0; x < MAZE_SIZE; x++) {
+          const cell = maze[y][x];
+          const cx = x * CELL_SIZE;
+          const cz = y * CELL_SIZE;
+          // Top wall
+          if (cell.walls[0]) {
+            const wall = new THREE.Mesh(wallGeo, wallMat);
+            wall.position.set(cx + CELL_SIZE / 2, 2, cz);
+            scene.add(wall);
+            objects.push(wall);
+          }
+          // Left wall
+          if (cell.walls[3]) {
+            const wall = new THREE.Mesh(wallGeo, wallMat);
+            wall.rotation.y = Math.PI / 2;
+            wall.position.set(cx, 2, cz + CELL_SIZE / 2);
+            scene.add(wall);
+            objects.push(wall);
+          }
+          // Right wall (last column)
+          if (x === MAZE_SIZE - 1 && cell.walls[1]) {
+            const wall = new THREE.Mesh(wallGeo, wallMat);
+            wall.rotation.y = Math.PI / 2;
+            wall.position.set(cx + CELL_SIZE, 2, cz + CELL_SIZE / 2);
+            scene.add(wall);
+            objects.push(wall);
+          }
+          // Bottom wall (last row)
+          if (y === MAZE_SIZE - 1 && cell.walls[2]) {
+            const wall = new THREE.Mesh(wallGeo, wallMat);
+            wall.position.set(cx + CELL_SIZE / 2, 2, cz + CELL_SIZE);
+            scene.add(wall);
+            objects.push(wall);
+          }
+        }
+      }
+
+      // Exit block
+      const exitGeo = new THREE.BoxGeometry(CELL_SIZE * 0.6, 2, CELL_SIZE * 0.6);
+      const exitMat = new THREE.MeshPhongMaterial({ color: 0x00ff66 });
+      exit = new THREE.Mesh(exitGeo, exitMat);
+      exit.position.set(exitPos.x * CELL_SIZE + CELL_SIZE / 2, 1, exitPos.y * CELL_SIZE + CELL_SIZE / 2);
+      scene.add(exit);
+
+      // Renderer
+      if (!renderer) {
+        renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        document.body.appendChild(renderer.domElement);
+      } else {
+        renderer.setSize(window.innerWidth, window.innerHeight);
+      }
+
+      // Controls
+      if (!controls) {
+        controls = new PointerLockControls(camera, document.body);
+        document.body.addEventListener('click', () => {
+          controls.lock();
+        });
+        controls.addEventListener('lock', () => {
+          document.getElementById('instructions').style.display = 'none';
+        });
+        controls.addEventListener('unlock', () => {
+          document.getElementById('instructions').style.display = '';
+        });
+      }
+
+      // Movement
+      document.removeEventListener('keydown', keydownHandler);
+      document.removeEventListener('keyup', keyupHandler);
+      document.addEventListener('keydown', keydownHandler);
+      document.addEventListener('keyup', keyupHandler);
+      document.removeEventListener('keydown', noclipHandler);
+      document.addEventListener('keydown', noclipHandler);
+      document.removeEventListener('keydown', flashlightHandler);
+      document.addEventListener('keydown', flashlightHandler);
+
+      window.addEventListener('resize', () => {
+        camera.aspect = window.innerWidth / window.innerHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(window.innerWidth, window.innerHeight);
+      });
+
+      // Enemy
+      addEnemy();
+      enemyPathCells = [];
+      enemyPathTimer = 0;
+    }
+
+    function keydownHandler(e) {
+      if (e.code === 'KeyW') move.forward = true;
+      if (e.code === 'KeyS') move.backward = true;
+      if (e.code === 'KeyA') move.left = true;
+      if (e.code === 'KeyD') move.right = true;
+      if (e.code === 'Space') move.jump = true;
+      if (e.code === 'ShiftLeft' || e.code === 'ShiftRight') move.down = true;
+    }
+    function keyupHandler(e) {
+      if (e.code === 'KeyW') move.forward = false;
+      if (e.code === 'KeyS') move.backward = false;
+      if (e.code === 'KeyA') move.left = false;
+      if (e.code === 'KeyD') move.right = false;
+      if (e.code === 'Space') move.jump = false;
+      if (e.code === 'ShiftLeft' || e.code === 'ShiftRight') move.down = false;
+    }
+    function noclipHandler(e) {
+      if (e.code === 'KeyI') {
+        noclip = !noclip;
+        document.getElementById('noclip-indicator').style.display = noclip ? '' : 'none';
+      }
+    }
+    function flashlightHandler(e) {
+      if (e.code === 'KeyE' && batteryLevel > 0) {
+        isFlashlightOn = !isFlashlightOn;
+        flashlight.intensity = isFlashlightOn ? 3 : 0;
+      }
+    }
+
+    function collide(pos) {
+      if (noclip) return false;
+      const playerRadius = 1.0;
+      for (const wall of objects) {
+        let wallMinX, wallMaxX, wallMinZ, wallMaxZ;
+        if (Math.abs(wall.rotation.y) < 0.01) {
+          wallMinX = wall.position.x - CELL_SIZE / 2;
+          wallMaxX = wall.position.x + CELL_SIZE / 2;
+          wallMinZ = wall.position.z - 0.25;
+          wallMaxZ = wall.position.z + 0.25;
+        } else {
+          wallMinX = wall.position.x - 0.25;
+          wallMaxX = wall.position.x + 0.25;
+          wallMinZ = wall.position.z - CELL_SIZE / 2;
+          wallMaxZ = wall.position.z + CELL_SIZE / 2;
+        }
+        const playerMinX = pos.x - playerRadius;
+        const playerMaxX = pos.x + playerRadius;
+        const playerMinZ = pos.z - playerRadius;
+        const playerMaxZ = pos.z + playerRadius;
+        const overlapX = wallMinX <= playerMaxX && wallMaxX >= playerMinX;
+        const overlapZ = wallMinZ <= playerMaxZ && wallMaxZ >= playerMinZ;
+        if (overlapX && overlapZ) return true;
+      }
+      return false;
+    }
+
+    function update() {
+      if (win || gameOver) return;
+      if (!controls.isLocked) return;
+      const speed = 20;
+      const jumpSpeed = 10;
+      const gravity = 30;
+      const groundY = 2;
+      const time = performance.now();
+      const delta = (time - prevTime) / 1000;
+      prevTime = time;
+      let dir = new THREE.Vector3();
+      controls.getDirection(dir);
+      dir.y = 0;
+      dir.normalize();
+      let right = new THREE.Vector3();
+      right.crossVectors(dir, new THREE.Vector3(0, 1, 0)).normalize();
+      let moveVec = new THREE.Vector3();
+      if (move.forward) moveVec.add(dir);
+      if (move.backward) moveVec.addScaledVector(dir, -1);
+      if (move.left) moveVec.addScaledVector(right, -1);
+      if (move.right) moveVec.add(right);
+      // Horizontal movement
+      if (moveVec.lengthSq() > 0) {
+        moveVec.normalize();
+        moveVec.multiplyScalar(speed * delta);
+        const pos = camera.position.clone().add(new THREE.Vector3(moveVec.x, 0, moveVec.z));
+        if (!collide(pos)) {
+          camera.position.x = pos.x;
+          camera.position.z = pos.z;
+        } else {
+          const posX = camera.position.clone().add(new THREE.Vector3(moveVec.x, 0, 0));
+          if (!collide(posX)) {
+            camera.position.x = posX.x;
+          }
+          const posZ = camera.position.clone().add(new THREE.Vector3(0, 0, moveVec.z));
+          if (!collide(posZ)) {
+            camera.position.z = posZ.z;
+          }
+        }
+      }
+      // Jumping and gravity
+      if (noclip) {
+        camera.position.y += (move.jump ? speed * delta : 0);
+        camera.position.y -= (move.down ? speed * delta : 0);
+        isOnGround = false;
+        velocityY = 0;
+      } else {
+        // Apply gravity
+        velocityY -= gravity * delta;
+        let nextY = camera.position.y + velocityY * delta;
+        if (nextY <= groundY) {
+          nextY = groundY;
+          velocityY = 0;
+          isOnGround = true;
+        } else {
+          isOnGround = false;
+        }
+        camera.position.y = nextY;
+        // Jump
+        if (move.jump && isOnGround) {
+          velocityY = jumpSpeed;
+          isOnGround = false;
+        }
+      }
+
+      // Update flashlight position and battery
+      if (flashlight) {
+        flashlight.position.copy(camera.position);
+        const flashlightTarget = new THREE.Vector3();
+        camera.getWorldDirection(flashlightTarget);
+        flashlightTarget.multiplyScalar(10);
+        flashlightTarget.add(camera.position);
+        flashlight.target.position.copy(flashlightTarget);
+      }
+      if (isFlashlightOn && batteryLevel > 0) {
+        batteryLevel -= batteryDrainRate * delta;
+        if (batteryLevel <= 0) {
+          batteryLevel = 0;
+          isFlashlightOn = false;
+          flashlight.intensity = 0;
+        }
+        document.getElementById('battery-display').textContent = 'Battery: ' + Math.floor(batteryLevel) + '%';
+      }
+
+      // Enemy movement
+      updateEnemy(delta);
+
+      // Player-enemy collision
+      if (enemyCooldown > 0) enemyCooldown -= delta;
+      if (playerHP > 0 && enemyCooldown <= 0 && playerCollidesWithEnemy()) {
+        playerHP--;
+        document.getElementById('hp-display').textContent = 'HP: ' + playerHP;
+        enemyCooldown = 1.0; // 1 second invulnerability
+        if (playerHP <= 0) {
+          showGameOver();
+          return;
+        }
+      }
+
+      const ex = exit.position.x, ez = exit.position.z;
+      if (Math.abs(camera.position.x - ex) < 2 && Math.abs(camera.position.z - ez) < 2) {
+        document.getElementById('win-overlay').style.display = 'flex';
+        win = true;
+        controls.unlock();
+      }
+    }
+    function animate() {
+      requestAnimationFrame(animate);
+      if (typeof update === 'function') update();
+      renderer.render(scene, camera);
+      // Compass update
+      updateCompass();
+      updateDangerIndicator();
+    }
+
+    function updateCompass() {
+      if (!camera || !exit) return;
+      // Player position and direction
+      const playerPos = camera.position;
+      const exitVec = new THREE.Vector3(exit.position.x - playerPos.x, 0, exit.position.z - playerPos.z);
+      // Camera forward direction
+      let forward = new THREE.Vector3();
+      camera.getWorldDirection(forward);
+      forward.y = 0;
+      forward.normalize();
+      // Angle between forward and exit
+      const angle = Math.atan2(exitVec.x, exitVec.z) - Math.atan2(forward.x, forward.z);
+      // Rotate compass needle
+      const needle = document.getElementById('compass-needle');
+      needle.setAttribute('transform', `rotate(${angle * 180 / Math.PI} 40 40)`);
+    }
+
+    document.getElementById('restart-btn').onclick = () => {
+      document.getElementById('win-overlay').style.display = 'none';
+      init();
+    };
+
+    function addEnemy() {
+      // Remove old enemy if present
+      if (enemy) scene.remove(enemy);
+
+      // Load custom model
+      const loader = new GLTFLoader();
+      loader.load('LEBROOON.glb', (gltf) => {
+        enemy = gltf.scene;
+        // Optionally scale/position the model
+        const mid = Math.floor(MAZE_SIZE / 2);
+        enemy.position.set(mid * CELL_SIZE + CELL_SIZE / 2, 2, mid * CELL_SIZE + CELL_SIZE / 2);
+        enemy.scale.set(4, 4, 4); // Adjust scale as needed
+        scene.add(enemy);
+      });
+
+      const mid = Math.floor(MAZE_SIZE / 2);
+      enemySpeed = 6;
+      enemyCooldown = 0;
+      enemyPathCells = [];
+      enemyPathTimer = .5;
+    }
+
+    function updateEnemy(delta) {
+      if (!enemy) return;
+      // Debug: Log flashlight state and enemy visibility
+      console.log('Flashlight on:', isFlashlightOn, 'Battery:', batteryLevel);
+
+      // Check if enemy is in player's field of view (only if flashlight is on or battery is dead)
+      let isEnemyVisible = false;
+      if (isFlashlightOn) {
+        const enemyToPlayer = camera.position.clone().sub(enemy.position);
+        const playerForward = new THREE.Vector3();
+        camera.getWorldDirection(playerForward);
+        const angle = enemyToPlayer.angleTo(playerForward);
+        const fov = Math.PI / 3; // 60 degrees FOV
+        const distanceToEnemy = enemyToPlayer.length();
+        
+        // Check if enemy is within FOV and range
+        if (angle < fov && distanceToEnemy < 50) {
+          // Use raycasting to check if walls block line of sight
+          const raycaster = new THREE.Raycaster();
+          raycaster.set(camera.position, enemyToPlayer.normalize());
+          const intersects = raycaster.intersectObjects(objects);
+          
+          // Enemy is visible only if no walls block the line of sight
+          const isBlocked = intersects.length > 0 && intersects[0].distance < distanceToEnemy;
+          isEnemyVisible = !isBlocked;
+        } else {
+          isEnemyVisible = false;
+        }
+      }
+
+      // Only move if player isn't looking at enemy (or if battery is dead)
+      if (isEnemyVisible) {
+        console.log('ENEMY FROZEN - Player is looking at enemy!');
+        return; // Enemy freezes when player is looking (unless battery is dead)
+      }
+      console.log('Enemy moving...');
+
+      // Recalculate path every 0.
+      enemyPathTimer -= delta;
+      if (enemyPathTimer <= 0) {
+        const enemyCell = worldToCell(enemy.position);
+        const playerCell = worldToCell(camera.position);
+        enemyPathCells = aStar(enemyCell, playerCell);
+        // Remove the first cell (current position)
+        if (enemyPathCells.length > 1) enemyPathCells.shift();
+        enemyPathTimer = 0.5;
+      }
+      if (!enemyPathCells || enemyPathCells.length === 0) return;
+      // Move toward next cell in path
+      const next = enemyPathCells[0];
+      const targetPos = new THREE.Vector3(next.x * CELL_SIZE + CELL_SIZE / 2, 2, next.y * CELL_SIZE + CELL_SIZE / 2);
+      const dir = targetPos.clone().sub(enemy.position);
+      const dist = dir.length();
+      if (dist < 0.2) {
+        enemyPathCells.shift();
+        return;
+      }
+      dir.normalize();
+      enemy.position.addScaledVector(dir, enemySpeed * delta);
+
+      // Make the enemy face the player horizontally
+      const lookAtPos = camera.position.clone();
+      lookAtPos.y = enemy.position.y; // Only rotate on the Y axis
+      enemy.lookAt(lookAtPos);
+    }
+
+    function playerCollidesWithEnemy() {
+      if (!enemy) return false;
+      const dx = camera.position.x - enemy.position.x;
+      const dz = camera.position.z - enemy.position.z;
+      const dy = camera.position.y - enemy.position.y;
+      const distSq = dx * dx + dz * dz + dy * dy;
+      return distSq < 9; // radius sum squared (player ~1.5, enemy 2)
+    }
+
+    function showGameOver() {
+      gameOver = true;
+      document.getElementById('gameover-overlay').style.display = 'flex';
+      controls.unlock();
+    }
+
+    document.getElementById('gameover-restart-btn').onclick = () => {
+      document.getElementById('gameover-overlay').style.display = 'none';
+      init();
+    };
+
+    function worldToCell(pos) {
+      return {
+        x: Math.floor(pos.x / CELL_SIZE),
+        y: Math.floor(pos.z / CELL_SIZE)
+      };
+    }
+
+    // A* pathfinding for maze
+    function aStar(start, goal) {
+      const open = [];
+      const closed = new Set();
+      const cameFrom = {};
+      const gScore = {};
+      const fScore = {};
+      function key(cell) { return cell.x + "," + cell.y; }
+      function heuristic(a, b) { return Math.abs(a.x - b.x) + Math.abs(a.y - b.y); }
+      open.push(start);
+      gScore[key(start)] = 0;
+      fScore[key(start)] = heuristic(start, goal);
+      while (open.length > 0) {
+        // Get cell with lowest fScore
+        let currentIdx = 0;
+        for (let i = 1; i < open.length; i++) {
+          if (fScore[key(open[i])] < fScore[key(open[currentIdx])]) currentIdx = i;
+        }
+        const current = open[currentIdx];
+        if (current.x === goal.x && current.y === goal.y) {
+          // Reconstruct path
+          const path = [current];
+          let k = key(current);
+          while (cameFrom[k]) {
+            path.unshift(cameFrom[k]);
+            k = key(cameFrom[k]);
+          }
+          return path;
+        }
+        open.splice(currentIdx, 1);
+        closed.add(key(current));
+        // Neighbors (up, right, down, left)
+        const dirs = [
+          { dx: 0, dy: -1, wall: 0 },
+          { dx: 1, dy: 0, wall: 1 },
+          { dx: 0, dy: 1, wall: 2 },
+          { dx: -1, dy: 0, wall: 3 }
+        ];
+        for (const { dx, dy, wall } of dirs) {
+          const nx = current.x + dx;
+          const ny = current.y + dy;
+          if (nx < 0 || nx >= MAZE_SIZE || ny < 0 || ny >= MAZE_SIZE) continue;
+          // Check if wall blocks movement
+          if (maze[current.y][current.x].walls[wall]) continue;
+          const neighbor = { x: nx, y: ny };
+          if (closed.has(key(neighbor))) continue;
+          const tentativeG = gScore[key(current)] + 1;
+          if (gScore[key(neighbor)] === undefined || tentativeG < gScore[key(neighbor)]) {
+            cameFrom[key(neighbor)] = current;
+            gScore[key(neighbor)] = tentativeG;
+            fScore[key(neighbor)] = tentativeG + heuristic(neighbor, goal);
+            if (!open.some(c => c.x === neighbor.x && c.y === neighbor.y)) {
+              open.push(neighbor);
+            }
+          }
+        }
+      }
+      return [];
+    }
+
+    function updateDangerIndicator() {
+      if (!enemy || !camera) return;
+      const indicator = document.getElementById('danger-indicator');
+      const dx = camera.position.x - enemy.position.x;
+      const dz = camera.position.z - enemy.position.z;
+      const dy = camera.position.y - enemy.position.y;
+      const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
+      // Parameters for effect
+      const minDist = 6; // fully visible at this distance or closer
+      const maxDist = 20; // invisible at this distance or farther
+      if (dist > maxDist) {
+        indicator.style.display = 'none';
+        return;
+      }
+      indicator.style.display = '';
+      // Calculate opacity and size
+      let t = Math.max(0, Math.min(1, (maxDist - dist) / (maxDist - minDist)));
+      let opacity = 0.18 + 0.32 * t; // 0.18 to 0.5
+      let scale = 0.7 + 1.0 * t; // 0.7 to 1.7
+
+      // If very close, make it much more intense and add a pulse
+      if (dist <= minDist) {
+        // Pulse between 0.7 and 1.0 opacity and 1.7 and 2.2 scale
+        const pulse = 0.85 + 0.15 * Math.sin(performance.now() * 0.008);
+        opacity = 0.7 * pulse;
+        scale = 1.7 * pulse;
+      }
+
+      // FPS-style ring: radial-gradient with transparent center
+      indicator.style.background = `radial-gradient(circle, rgba(255,0,0,0) 55%, rgba(255,0,0,${opacity}) 70%, rgba(255,0,0,0.85) 100%)`;
+      indicator.style.transform = `scale(${scale})`;
+      indicator.style.borderRadius = '50%';
+      indicator.style.transition = 'background 0.1s, transform 0.1s';
+    }
+
+    init();
+    animate();
+  </script>
+</body>
+</html> 
